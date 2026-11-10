@@ -17,6 +17,17 @@ extension View {
         }
     }
 
+    /// Puts the view on a rounded panel of Liquid Glass.
+    @ViewBuilder
+    func glassPanel(cornerRadius: CGFloat = 14) -> some View {
+        if #available(macOS 26.0, *) {
+            glassEffect(.regular, in: .rect(cornerRadius: cornerRadius))
+        } else {
+            background(.regularMaterial, in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous).strokeBorder(.separator))
+        }
+    }
+
     /// Floats `bar` over one edge. Scrolling content passes underneath it and,
     /// on macOS 26, blurs out as it approaches (the scroll edge effect).
     @ViewBuilder

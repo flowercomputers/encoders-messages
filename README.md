@@ -82,6 +82,11 @@ Spotlight uses for Messages results. It is undocumented, so Apple could change i
   reacted: "messages i loved", "messages maya laughed at", "liked by me about
   cars", "heart reaction from maya". Results show the reactions each message
   received.
+- **A timeline of the matches.** Under the search field, the whole history is
+  drawn as a strip of time: grey for how much was said, colour for where the
+  strong matches fall. It is recomputed on every keystroke by scoring every
+  message (`ms_histogram`), one more full pass of a couple of milliseconds.
+  Click a year to narrow the results to it.
 - Overlapping results from one exchange are collapsed to the best one.
 - **Results are unbounded.** The list loads 60 at a time as you scroll. The
   core takes a (score, index) cursor and returns the next best matches after
@@ -98,7 +103,7 @@ On a synthetic database of 454,546 messages (10 performance cores, Apple silicon
 
 - read from SQLite: ~240 ms
 - embed everything, at all three granularities: ~250 ms
-- search, per keystroke: ~2.7 ms median
+- search plus timeline, per keystroke: ~4.5 ms median
 - memory for vectors: about 600 bytes per message (~270 MB here)
 
 Reproduce without touching real messages:

@@ -74,6 +74,22 @@ struct SearchResults {
     var filter = ""
     /// True once there is nothing further to page in.
     var exhausted = true
+    /// Strong matches per timeline bucket (see `TimeAxis`); empty if the query
+    /// has nothing to place in time.
+    var timeline: [Float] = []
+}
+
+/// The time axis of the timeline strip: the span of the whole history cut into
+/// equal buckets, with how many messages fall in each and where years begin.
+struct TimeAxis {
+    static let bucketCount = 120
+    /// Seconds since 2001 at the two ends.
+    var start = 0.0
+    var end = 1.0
+    /// Messages per bucket.
+    var volume: [Float] = []
+    /// Each calendar year's extent as fractions of the axis (0...1).
+    var years: [(year: Int, start: Double, end: Double)] = []
 }
 
 struct LoadStats {
@@ -149,6 +165,12 @@ final class MessageStore: @unchecked Sendable {
     }
     /// Lowercased name word -> handles of people with that name. Built lazily.
     private var peopleByName: [String: Set<Int32>]?
+    private(set) var axis = TimeAxis()
+    /// Message index -> its bucket on the time axis.
+    private var bucketOf: [UInt32] = []
+    /// A match counts on the timeline if it scores at least this share of the best score.
+    private static let timelineCutoff: Float = 0.65
+
     /// Where the current search has got to; see `nextPage`.
     private struct Paging {
         var token: Int
@@ -282,7 +304,10 @@ final class MessageStore: @unchecked Sendable {
         loadReactions(db)
         cachedMask = nil
         // No incremental indexing: with anything new, embed everything again.
-        if count > before { embedAll() }
+        if count > before {
+            embedAll()
+            buildTimeAxis()
+        }
         stats.messages = count
         return count - before
     }
@@ -489,6 +514,45 @@ final class MessageStore: @unchecked Sendable {
         return true
     }
 
+    /// Lays every message out on the time axis.
+    private func buildTimeAxis() {
+        var axis = TimeAxis()
+        var start = Double.infinity
+        var end = -Double.infinity
+        for i in 0..<count {
+            let t = seconds(i)
+            if t > 0 {
+                start = min(start, t)
+                end = max(end, t)
+            }
+        }
+        guard start < end else { return }
+        axis.start = start
+        axis.end = end
+
+        let buckets = TimeAxis.bucketCount
+        let scale = Double(buckets) / (end - start)
+        bucketOf = [UInt32](repeating: 0, count: count)
+        axis.volume = [Float](repeating: 0, count: buckets)
+        for i in 0..<count {
+            let bucket = min(buckets - 1, max(0, Int((seconds(i) - start) * scale)))
+            bucketOf[i] = UInt32(bucket)
+            axis.volume[bucket] += 1
+        }
+
+        let calendar = Calendar.current
+        let firstYear = calendar.component(.year, from: Date(timeIntervalSinceReferenceDate: start))
+        let lastYear = calendar.component(.year, from: Date(timeIntervalSinceReferenceDate: end))
+        func fraction(ofYear year: Int) -> Double {
+            let date = calendar.date(from: DateComponents(year: year, month: 1, day: 1)) ?? .distantPast
+            return min(1, max(0, (date.timeIntervalSinceReferenceDate - start) / (end - start)))
+        }
+        if lastYear - firstYear < 200 {
+            axis.years = (firstYear...lastYear).map { ($0, fraction(ofYear: $0), fraction(ofYear: $0 + 1)) }
+        }
+        self.axis = axis
+    }
+
     /// Embeds every message at all three granularities, replacing whatever was
     /// indexed before.
     private func embedAll() {
@@ -585,19 +649,23 @@ final class MessageStore: @unchecked Sendable {
 
     /// Starts a search and returns its first page. `token` identifies the
     /// search to `nextPage`, so a page requested for an older query is ignored.
-    func search(_ query: String, token: Int = 0) -> SearchResults {
+    /// Starts a search and returns its first page. `token` identifies the
+    /// search to `nextPage`, so a page requested for an older query is ignored.
+    /// `year` limits results to one calendar year (the timeline still covers
+    /// every year, so the others stay visible to pick from).
+    func search(_ query: String, token: Int = 0, year: Int? = nil) -> SearchResults {
         var results = SearchResults()
         let parsed = QueryParser.parse(query) { word in
             Self.ambiguousNames.contains(word) ? nil : self.people(named: word)
         }
         var mask: [UInt8]?
+        var described: [String] = []
         if parsed.isStructured {
             mask = self.mask(handles: parsed.handles, sender: parsed.sender, media: parsed.media, emoji: parsed.emoji, reaction: parsed.reaction)
             let names = Set(parsed.handles.map(name(forHandle:))).sorted()
             let from = !names.isEmpty ? "from " + names.formatted(.list(type: .or))
                 : parsed.sender == .others ? "from other people" : parsed.sender == .me ? "from you" : ""
-            results.filter = (["Only messages"]
-                + (from.isEmpty ? [] : [from])
+            described = (from.isEmpty ? [] : [from])
                 + (parsed.media.map { [$0.description] } ?? [])
                 + (parsed.emoji.map { [$0.description] } ?? [])
                 + (parsed.reaction.map { reaction in
@@ -605,14 +673,54 @@ final class MessageStore: @unchecked Sendable {
                     let by = !reactors.isEmpty ? " from " + reactors.formatted(.list(type: .or))
                         : reaction.by == .me ? " from you" : reaction.by == .others ? " from someone else" : ""
                     return [reaction.description + by]
-                } ?? [])).joined(separator: " ")
+                } ?? [])
         }
-        paging = Paging(token: token, count: count, query: Array(parsed.remainder.utf8), weights: settings.weights, brevity: settings.brevity, mask: mask, nextRecent: count - 1)
+        let remainder = Array(parsed.remainder.utf8)
+        results.timeline = timeline(query: remainder, mask: mask)
+
+        if let year {
+            // Narrow to the year after the timeline is drawn from everything.
+            let calendar = Calendar.current
+            let from = calendar.date(from: DateComponents(year: year, month: 1, day: 1))?.timeIntervalSinceReferenceDate ?? 0
+            let to = calendar.date(from: DateComponents(year: year + 1, month: 1, day: 1))?.timeIntervalSinceReferenceDate ?? 0
+            var narrowed = mask ?? [UInt8](repeating: 1, count: count)
+            for i in 0..<count where narrowed[i] != 0 {
+                let t = seconds(i)
+                if t < from || t >= to { narrowed[i] = 0 }
+            }
+            mask = narrowed
+            described.append("in \(year)")
+        }
+        if !described.isEmpty { results.filter = (["Only messages"] + described).joined(separator: " ") }
+
+        paging = Paging(token: token, count: count, query: remainder, weights: settings.weights, brevity: settings.brevity, mask: mask, nextRecent: count - 1)
         if let page = nextPage(token: token) {
             results.hits = page.hits
             results.exhausted = page.exhausted
         }
         return results
+    }
+
+    /// How many strong matches fall in each bucket of the time axis. With
+    /// words to match, every message is scored (one more full pass); with
+    /// only a filter, it is a count of what passes.
+    private func timeline(query: [UInt8], mask: [UInt8]?) -> [Float] {
+        guard bucketOf.count == count, count > 0 else { return [] }
+        var buckets = [Float](repeating: 0, count: TimeAxis.bucketCount)
+        if query.isEmpty {
+            guard let mask else { return [] }
+            for i in 0..<count where mask[i] != 0 { buckets[Int(bucketOf[i])] += 1 }
+            return buckets
+        }
+        let best = query.withUnsafeBufferPointer { q in
+            if let mask {
+                return mask.withUnsafeBufferPointer {
+                    ms_histogram(q.baseAddress, q.count, settings.weights, settings.brevity, $0.baseAddress, bucketOf, buckets.count, Self.timelineCutoff, &buckets)
+                }
+            }
+            return ms_histogram(q.baseAddress, q.count, settings.weights, settings.brevity, nil, bucketOf, buckets.count, Self.timelineCutoff, &buckets)
+        }
+        return best > 0 ? buckets : []
     }
 
     /// The next `limit` results of the search started with `token`, or nil if

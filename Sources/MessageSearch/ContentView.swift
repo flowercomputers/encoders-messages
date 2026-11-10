@@ -17,7 +17,18 @@ struct ContentView: View {
             // after the first character typed.
             ZStack { content }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .floatingBar(edge: .top) { filterChip }
+                .floatingBar(edge: .top) {
+                    VStack(spacing: 0) {
+                        if !model.axis.volume.isEmpty {
+                            TimelineStrip(axis: model.axis, matches: model.timeline, selectedYear: $model.selectedYear)
+                                .frame(height: 50)
+                                .glassPanel()
+                                .padding(.horizontal, 12)
+                                .padding(.top, 6)
+                        }
+                        filterChip
+                    }
+                }
                 .floatingBar(edge: .bottom) { footer }
                 .toolbar {
                     ToolbarItem(placement: .principal) {

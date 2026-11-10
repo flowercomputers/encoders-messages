@@ -63,16 +63,24 @@ func runBenchmark(path: String, queries: [String]) {
         var times: [Double] = []
         var hits: [Hit] = []
         var filter = ""
+        var timeline: [Float] = []
         for _ in 0..<200 {
             let started = CFAbsoluteTimeGetCurrent()
             let results = store.search(query, token: 1)
             hits = results.hits
             filter = results.filter
+            timeline = results.timeline
             times.append(CFAbsoluteTimeGetCurrent() - started)
         }
         times.sort()
         print(String(format: "\n\"%@\": median %.2f ms, p95 %.2f ms", query, times[100] * 1000, times[190] * 1000))
         if !filter.isEmpty { print("  filter: \(filter)") }
+        if !timeline.isEmpty {
+            // The timeline as a row of digits: 0 is empty, 9 is the fullest bucket.
+            let most = max(1, timeline.max() ?? 1)
+            let row = timeline.map { $0 == 0 ? "·" : String(min(9, Int(($0 / most * 9).rounded(.up)))) }.joined()
+            print("  timeline (\(Int(timeline.reduce(0, +))) strong matches): \(row)")
+        }
         // Page on from the first page, as scrolling would.
         var seen = Set(hits.map(\.id))
         var total = hits.count

@@ -152,6 +152,65 @@ enum Source<'a> {
     Mapped { weight: f32, scores: Vec<f32>, map: &'a [u32] },
 }
 
+/// Scores messages against one query: `sum(weight * similarity)` over the
+/// layers, each similarity being the cosine scaled by the brevity prior.
+struct Scorer<'a> {
+    q: [i8; D],
+    q_inv: f32,
+    count: usize,
+    sources: Vec<Source<'a>>,
+}
+
+impl<'a> Scorer<'a> {
+    /// None if the query embeds to nothing or no layer can be used.
+    fn new(index: &'a [Layer; LAYERS], query: &[u8], weights: &[f32], brevity: &[f32]) -> Option<Self> {
+        let embedded = encoders::encode_single(String::from_utf8_lossy(query));
+        let mut q = [0i8; D];
+        let q_inv = quantize(&embedded, &mut q);
+        if q_inv == 0.0 {
+            return None;
+        }
+        let count = index[0].inv_norms.len();
+        let sources: Vec<Source> = index
+            .iter()
+            .zip(weights.iter().zip(brevity))
+            .filter(|(layer, (weight, _))| **weight != 0.0 && !layer.inv_norms.is_empty())
+            .filter_map(|(layer, (&weight, &brevity))| {
+                if layer.map.is_empty() {
+                    (layer.inv_norms.len() >= count).then_some(Source::Direct { weight, brevity, layer })
+                } else if layer.map.len() >= count {
+                    let scores = layer
+                        .vecs
+                        .par_chunks_exact(D)
+                        .zip(layer.inv_norms.par_iter().zip(&layer.lengths))
+                        .map(|(v, (inv, len))| dot(&q, v) as f32 * inv * q_inv * (len / (len + brevity)))
+                        .collect();
+                    Some(Source::Mapped { weight, scores, map: &layer.map })
+                } else {
+                    None
+                }
+            })
+            .collect();
+        (!sources.is_empty()).then_some(Scorer { q, q_inv, count, sources })
+    }
+
+    #[inline]
+    fn score(&self, i: usize) -> f32 {
+        let mut score = 0f32;
+        for source in &self.sources {
+            score += match source {
+                Source::Direct { weight, brevity, layer } => {
+                    let len = layer.lengths[i];
+                    let cosine = dot(&self.q, &layer.vecs[i * D..(i + 1) * D]) as f32 * layer.inv_norms[i] * self.q_inv;
+                    weight * cosine * (len / (len + brevity))
+                }
+                Source::Mapped { weight, scores, map } => weight * scores[map[i] as usize],
+            };
+        }
+        score
+    }
+}
+
 /// Find the `k` messages most similar to the query. A message's score is
 /// `sum(weights[l] * similarity in layer l)`; `weights` has `LAYERS` entries
 /// and a zero weight skips the layer entirely. Writes up to `k` message
@@ -174,9 +233,8 @@ enum Source<'a> {
 ///
 /// # Safety
 /// `query` must be valid for `query_len` bytes; `weights` and `brevity` for
-/// `LAYERS` floats each;
-/// `filter`, if not null, for `ms_count()` bytes; `out_indices` and
-/// `out_scores` must each have room for `k` entries.
+/// `LAYERS` floats each; `filter`, if not null, for `ms_count()` bytes;
+/// `out_indices` and `out_scores` must each have room for `k` entries.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ms_search(
     query: *const u8,
@@ -196,40 +254,13 @@ pub unsafe extern "C" fn ms_search(
     let query = unsafe { std::slice::from_raw_parts(query, query_len) };
     let weights = unsafe { std::slice::from_raw_parts(weights, LAYERS) };
     let brevity = unsafe { std::slice::from_raw_parts(brevity, LAYERS) };
-    let embedded = encoders::encode_single(String::from_utf8_lossy(query));
-    let mut q = [0i8; D];
-    let q_inv = quantize(&embedded, &mut q);
-    if q_inv == 0.0 {
-        return 0;
-    }
 
     let index = INDEX.read().unwrap();
-    let count = index[0].inv_norms.len();
-    let filter = (!filter.is_null()).then(|| unsafe { std::slice::from_raw_parts(filter, count) });
-
-    let sources: Vec<Source> = index
-        .iter()
-        .zip(weights.iter().zip(brevity))
-        .filter(|(layer, (weight, _))| **weight != 0.0 && !layer.inv_norms.is_empty())
-        .filter_map(|(layer, (&weight, &brevity))| {
-            if layer.map.is_empty() {
-                (layer.inv_norms.len() >= count).then_some(Source::Direct { weight, brevity, layer })
-            } else if layer.map.len() >= count {
-                let scores = layer
-                    .vecs
-                    .par_chunks_exact(D)
-                    .zip(layer.inv_norms.par_iter().zip(&layer.lengths))
-                    .map(|(v, (inv, len))| dot(&q, v) as f32 * inv * q_inv * (len / (len + brevity)))
-                    .collect();
-                Some(Source::Mapped { weight, scores, map: &layer.map })
-            } else {
-                None
-            }
-        })
-        .collect();
-    if sources.is_empty() {
+    let Some(scorer) = Scorer::new(&index, query, weights, brevity) else {
         return 0;
-    }
+    };
+    let count = scorer.count;
+    let filter = (!filter.is_null()).then(|| unsafe { std::slice::from_raw_parts(filter, count) });
 
     let mut hits = (0..count.div_ceil(SCAN_ROWS))
         .into_par_iter()
@@ -242,17 +273,7 @@ pub unsafe extern "C" fn ms_search(
                 if filter.is_some_and(|f| f[i] == 0) {
                     continue;
                 }
-                let mut score = 0f32;
-                for source in &sources {
-                    score += match source {
-                        Source::Direct { weight, brevity, layer } => {
-                            let len = layer.lengths[i];
-                            let cosine = dot(&q, &layer.vecs[i * D..(i + 1) * D]) as f32 * layer.inv_norms[i] * q_inv;
-                            weight * cosine * (len / (len + brevity))
-                        }
-                        Source::Mapped { weight, scores, map } => weight * scores[map[i] as usize],
-                    };
-                }
+                let score = scorer.score(i);
                 let index = i as u32;
                 if score > after_score || (score == after_score && index <= after_index) {
                     continue;
@@ -273,7 +294,7 @@ pub unsafe extern "C" fn ms_search(
             keep_top(&mut a, k);
             a
         });
-    drop(sources);
+    drop(scorer);
     drop(index);
 
     hits.sort_unstable_by(rank);
@@ -284,4 +305,64 @@ pub unsafe extern "C" fn ms_search(
         out_scores[i] = *score;
     }
     hits.len()
+}
+
+/// Where in time the matches are. Scores *every* message against the query,
+/// then counts the strong ones (score at least `cutoff` times the best score)
+/// into `out[bins[i]]`, where `bins` assigns each message to one of `bin_count`
+/// buckets. Returns the best score, or 0 if nothing matched.
+///
+/// This is the whole corpus scored on every keystroke, which is only worth
+/// doing because a full pass takes a couple of milliseconds.
+///
+/// # Safety
+/// As `ms_search`; `bins` must be valid for `ms_count()` entries, each below
+/// `bin_count`, and `out` for `bin_count` floats.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ms_histogram(
+    query: *const u8,
+    query_len: usize,
+    weights: *const f32,
+    brevity: *const f32,
+    filter: *const u8,
+    bins: *const u32,
+    bin_count: usize,
+    cutoff: f32,
+    out: *mut f32,
+) -> f32 {
+    let query = unsafe { std::slice::from_raw_parts(query, query_len) };
+    let weights = unsafe { std::slice::from_raw_parts(weights, LAYERS) };
+    let brevity = unsafe { std::slice::from_raw_parts(brevity, LAYERS) };
+    let out = unsafe { std::slice::from_raw_parts_mut(out, bin_count) };
+    out.fill(0.0);
+
+    let index = INDEX.read().unwrap();
+    let Some(scorer) = Scorer::new(&index, query, weights, brevity) else {
+        return 0.0;
+    };
+    let count = scorer.count;
+    let filter = (!filter.is_null()).then(|| unsafe { std::slice::from_raw_parts(filter, count) });
+    let bins = unsafe { std::slice::from_raw_parts(bins, count) };
+
+    let mut scores = vec![f32::NEG_INFINITY; count];
+    scores.par_chunks_mut(SCAN_ROWS).enumerate().for_each(|(chunk, scores)| {
+        let start = chunk * SCAN_ROWS;
+        for (offset, score) in scores.iter_mut().enumerate() {
+            let i = start + offset;
+            if !filter.is_some_and(|f| f[i] == 0) {
+                *score = scorer.score(i);
+            }
+        }
+    });
+    let best = scores.par_iter().copied().reduce(|| f32::NEG_INFINITY, f32::max);
+    if !(best > 0.0) {
+        return 0.0;
+    }
+    let floor = best * cutoff;
+    for (score, bin) in scores.iter().zip(bins) {
+        if *score >= floor {
+            out[(*bin as usize).min(bin_count - 1)] += 1.0;
+        }
+    }
+    best
 }

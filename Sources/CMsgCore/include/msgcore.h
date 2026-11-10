@@ -32,5 +32,12 @@ size_t ms_search(const uint8_t *query, size_t query_len, const float *weights,
                  const float *brevity, size_t k,
                  const uint8_t *filter, float after_score, uint32_t after_index,
                  uint32_t *out_indices, float *out_scores);
+/// Where in time the matches are: scores every message, then counts those
+/// scoring at least `cutoff` times the best score into out[bins[i]]. `bins`
+/// has one bucket number per message; `out` has `bin_count` entries. Returns
+/// the best score (0 if nothing matched).
+float ms_histogram(const uint8_t *query, size_t query_len, const float *weights,
+                   const float *brevity, const uint8_t *filter, const uint32_t *bins,
+                   size_t bin_count, float cutoff, float *out);
 
 #endif

@@ -17,6 +17,13 @@ final class AppModel: ObservableObject {
     @Published private(set) var hits: [Hit] = []
     /// The people / attachment filter found in the query, or "".
     @Published private(set) var filter = ""
+    /// The history laid out in time, and where the current matches fall on it.
+    @Published private(set) var axis = TimeAxis()
+    @Published private(set) var timeline: [Float] = []
+    /// A year picked on the timeline; results are limited to it.
+    @Published var selectedYear: Int? {
+        didSet { if selectedYear != oldValue { search() } }
+    }
     /// False once every result has been loaded.
     @Published private(set) var canLoadMore = false
     private var loadingMore = false
@@ -65,11 +72,13 @@ final class AppModel: ObservableObject {
                 }
             }
             let stats = store.stats
+            let axis = store.axis
             DispatchQueue.main.async {
                 self.loading = false
                 switch result {
                 case .success(let added):
                     self.stats = stats
+                    if added > 0 || self.axis.volume.isEmpty { self.axis = axis }
                     self.indexed = stats.messages
                     let wasReady = self.phase == .ready
                     self.phase = .ready
@@ -93,19 +102,22 @@ final class AppModel: ObservableObject {
         let query = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty else {
             hits = []
+            timeline = []
             canLoadMore = false
             filter = ""
             selection = 0
             return
         }
         let store = store
+        let year = selectedYear
         engine.async {
             let started = CFAbsoluteTimeGetCurrent()
-            let results = store.search(query, token: generation)
+            let results = store.search(query, token: generation, year: year)
             let elapsed = CFAbsoluteTimeGetCurrent() - started
             DispatchQueue.main.async {
                 guard generation == self.generation else { return }  // a newer keystroke won
                 self.hits = results.hits
+                self.timeline = results.timeline
                 self.canLoadMore = !results.exhausted
                 self.loadingMore = false
                 self.filter = results.filter
