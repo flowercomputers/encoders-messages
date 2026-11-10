@@ -14,9 +14,6 @@ ready before the window finishes appearing. Nothing leaves your Mac.
 Download the DMG from the [latest release](../../releases/latest), drag
 Message Search to Applications, and open it. Apple silicon, macOS 14 or later.
 
-The build is signed but **not notarized**, so the first time macOS will refuse
-to open it: go to System Settings → Privacy & Security and choose Open Anyway.
-
 ## Build and run
 
 Needs Xcode (Swift 5.9+) and Rust 1.88+.
@@ -99,7 +96,8 @@ swiftc -O scripts/make_test_db.swift -o /tmp/make_test_db -lsqlite3 && /tmp/make
 
 `--db <path>` and `--query <text>` also work with the windowed app.
 
-`scripts/make_dmg.sh` builds the app and packs `build/MessageSearch-<version>.dmg`.
+`scripts/release.sh` builds a notarized `build/MessageSearch-<version>.dmg`,
+signing and notarizing through the Apple account Xcode is signed in to.
 
 ## Knobs
 

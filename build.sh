@@ -15,6 +15,6 @@ cp Info.plist "$APP/Contents/Info.plist"
 # Sign with a real identity when there is one, so the Full Disk Access grant
 # survives rebuilds (an ad-hoc signature changes with every build).
 IDENTITY="${CODESIGN_IDENTITY:-$(security find-identity -v -p codesigning | awk '/^ *1\)/ {print $2}')}"
-codesign --force --sign "${IDENTITY:--}" "$APP"
+codesign --force --options runtime --entitlements MessageSearch.entitlements --sign "${IDENTITY:--}" "$APP"
 
 echo "Built $APP"
