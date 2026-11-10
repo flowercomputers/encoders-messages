@@ -1,0 +1,19 @@
+[package]
+name = "msgcore"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+# Model, width and dtype are pinned explicitly, as the encoders readme asks.
+# Nothing is persisted (the index is rebuilt on every launch), so changing
+# these is safe: just rebuild.
+encoders = { version = "3", features = ["bekko-static-v1-slim-100k", "mrl-256", "int8", "rayon"] }
+rayon = "1"
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+panic = "abort"
