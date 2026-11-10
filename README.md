@@ -39,7 +39,7 @@ compiles it into the binary.
 | Piece | Where | What it does |
 | --- | --- | --- |
 | Reader | `Sources/MessageSearch/MessageStore.swift` | Opens `chat.db` read-only, pulls message text into one contiguous UTF-8 buffer. Decodes `attributedBody` (where modern macOS keeps the text) by scanning the typedstream bytes directly, with `NSUnarchiver` as a fallback. |
-| Core | `core/src/lib.rs` | Rust static library. Embeds with `encoders` (`bekko-static-v1-slim-100k`, 256 dimensions), stores each vector as 256 int8 + one float, and answers a query with a parallel brute-force cosine scan. |
+| Core | `core/src/lib.rs` | Rust static library. Embeds with `encoders` (`bekko-static-v1-slim-100k`, 256 dimensions) into three layers of int8 vectors, and answers a query with a parallel brute-force scan that blends the layers. |
 | UI | `Sources/MessageSearch/ContentView.swift`, `AppModel.swift` | SwiftUI. Every keystroke runs a full search. Arrow keys move, Return or a click opens the message. New messages are picked up every 2 seconds. |
 
 Opening a message uses `sms://open?message-guid=<guid>`, the URL scheme
@@ -47,9 +47,14 @@ Spotlight uses for Messages results. It is undocumented, so Apple could change i
 
 ## What gets matched
 
-- **Exchanges, not single messages.** Each message is embedded together with up
-  to two messages before and after it in the same chat (within 20 minutes),
-  with the message itself counted twice. Results show that exchange.
+- **Three granularities, blended.** Every message is embedded three ways: on
+  its own, as part of its *exchange* (two messages either side), and as part
+  of its *sitting* (the whole stretch of conversation, until a 30-minute
+  pause). A search scores all three and blends them, so a specific phrase, a
+  back-and-forth, and "that conversation about moving" can all be found.
+  Results show the exchange. The weights and chunking live in `SearchSettings`.
+- **No incremental indexing.** When a message arrives, everything is embedded
+  again. It takes a fraction of a second, and no result is ever stale.
 - **Short texts are pulled down**, so "What news" does not beat a real
   conversation that mentions news.
 - **A contact's name in the query is a filter**, not a word to match: "maya
@@ -65,6 +70,18 @@ Spotlight uses for Messages results. It is undocumented, so Apple could change i
   so file names are searchable. Results show the files themselves: Quick Look
   thumbnails for photos and videos (`AttachmentViews.swift`), a named chip for
   other files, and an icon when the file is not on this Mac. The parser is `Sources/MessageSearch/QueryFilter.swift`.
+- **Emoji are a filter as well.** The embedding model cannot see emoji, so
+  the app indexes which emoji each message contains and matches them by Unicode
+  name: "someone sends heart emoji" finds ❤ 💙 😍 and so on, "fire emoji" finds
+  🔥, and typing an emoji into the query finds messages containing it.
+- **Reactions and stickers too.** Tapbacks carry no text for encoders to
+  embed, so they narrow the messages it then ranks: "liked messages about
+  cars" is "about cars" among messages that got a 👍. Also "messages with a
+  heart reaction", "fire reaction" (emoji tapbacks, by name), "❤️ reaction",
+  "sticker reaction", and "maya sends a sticker". Queries can say who
+  reacted: "messages i loved", "messages maya laughed at", "liked by me about
+  cars", "heart reaction from maya". Results show the reactions each message
+  received.
 - Overlapping results from one exchange are collapsed to the best one.
 - **Results are unbounded.** The list loads 60 at a time as you scroll. The
   core takes a (score, index) cursor and returns the next best matches after
@@ -80,9 +97,9 @@ talk that mentions news, not someone announcing a new job.
 On a synthetic database of 454,546 messages (10 performance cores, Apple silicon):
 
 - read from SQLite: ~240 ms
-- embed every message's exchange: ~125 ms
-- search, per keystroke: ~1.3 ms median, 1.9 ms p95
-- memory for vectors: 260 bytes per message (~118 MB here)
+- embed everything, at all three granularities: ~250 ms
+- search, per keystroke: ~2.7 ms median
+- memory for vectors: about 600 bytes per message (~270 MB here)
 
 Reproduce without touching real messages:
 

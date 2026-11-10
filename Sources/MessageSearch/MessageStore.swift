@@ -2,6 +2,39 @@ import CMsgCore
 import Foundation
 import SQLite3
 
+/// How messages are chunked for embedding and how the layers are blended.
+/// Changing a weight only changes the next search; changing how text is
+/// chunked means embedding again (`MessageStore.settings` does that).
+struct SearchSettings: Equatable {
+    /// Blend weights for the message, exchange and sitting layers.
+    var messageWeight: Float = 0.4
+    var exchangeWeight: Float = 0.4
+    var sittingWeight: Float = 0.2
+    /// How many messages either side of a message make up its exchange.
+    var exchangeReach = 2
+    /// Messages further apart than this (seconds) are not the same exchange.
+    var exchangeGap = 20.0 * 60
+    /// A pause longer than this (seconds) ends a sitting.
+    var sittingGap = 30.0 * 60
+    /// Longest sitting, in messages; a marathon conversation is split.
+    var sittingLimit = 40
+
+    /// How hard short texts are pulled down, per layer: a text of this many
+    /// bytes scores half its cosine. Stops "What news" from beating a real
+    /// conversation about the news.
+    var messageBrevity: Float = 4
+    var exchangeBrevity: Float = 24
+    var sittingBrevity: Float = 24
+
+    var weights: [Float] { [messageWeight, exchangeWeight, sittingWeight] }
+    var brevity: [Float] { [messageBrevity, exchangeBrevity, sittingBrevity] }
+    /// True if `other` chunks text differently, so the layers must be rebuilt.
+    func chunksDiffer(from other: SearchSettings) -> Bool {
+        exchangeReach != other.exchangeReach || exchangeGap != other.exchangeGap
+            || sittingGap != other.sittingGap || sittingLimit != other.sittingLimit
+    }
+}
+
 /// One search result: the matched message and the exchange around it.
 struct Hit: Identifiable {
     struct Line: Identifiable {
@@ -10,6 +43,8 @@ struct Hit: Identifiable {
         let text: String
         let isMatch: Bool
         let attachments: [Attachment]
+        /// Tapbacks and stickers put on this message, as glyphs: "❤️", "👍 2".
+        let reactions: [String]
     }
 
     let id: Int          // position in the index
@@ -59,10 +94,17 @@ enum StoreError: Error {
 /// never creates a Swift String per message; Strings are made only for the few
 /// rows that end up on screen.
 ///
-/// What gets embedded for a message is not the message alone but its
-/// *exchange*: up to two messages before and after it in the same chat (within
-/// `exchangeGap`), with the message itself counted twice. People text in
-/// fragments, so the meaning usually lives in the exchange.
+/// Every message is embedded at three granularities, and a search blends its
+/// similarity in all three (see `SearchSettings`):
+///
+/// - the **message** alone, for a specific phrase;
+/// - its **exchange**, the few messages either side of it, because people text
+///   in fragments and the meaning usually lives in the back-and-forth;
+/// - its **sitting**, the whole stretch of conversation it belongs to, for
+///   "that time we talked about moving".
+///
+/// Embedding all of it takes a fraction of a second, so there is no
+/// incremental indexing: when a message arrives, everything is embedded again.
 final class MessageStore: @unchecked Sendable {
     static let defaultPath = NSHomeDirectory() + "/Library/Messages/chat.db"
 
@@ -82,9 +124,15 @@ final class MessageStore: @unchecked Sendable {
     private var lastInChat: [Int32: Int32] = [:]
     /// Per kind (indexed by `MediaKind.rawValue`), how many each message carries.
     private var media = [ContiguousArray<UInt8>](repeating: [], count: MediaKind.allCases.count)
+    /// Message index -> the reactions it has received.
+    private var reactions: [Int: [Reaction]] = [:]
+    /// Emoji code point -> the messages containing it, in index order.
+    private var emojiMessages: [UInt32: [Int32]] = [:]
     /// Message index -> its attachments, for the messages that have any.
     private var attachments: [Int: [Attachment]] = [:]
-    private var embedded = 0
+    var settings = SearchSettings() {
+        didSet { if settings.chunksDiffer(from: oldValue) { embedAll() } }
+    }
     private var maxRowID: Int64 = 0
 
     private struct Chat {
@@ -106,6 +154,8 @@ final class MessageStore: @unchecked Sendable {
         var token: Int
         var count: Int
         var query: [UInt8]
+        var weights: [Float]
+        var brevity: [Float]
         var mask: [UInt8]?
         /// Messages already shown as part of some result's exchange.
         var shown = Set<Int>()
@@ -118,13 +168,10 @@ final class MessageStore: @unchecked Sendable {
     }
     private var paging: Paging?
 
-    private var cachedMask: (handles: Set<Int32>, sender: QueryParser.Sender, media: MediaFilter?, count: Int, mask: [UInt8])?
+    private var cachedMask: (handles: Set<Int32>, sender: QueryParser.Sender, media: MediaFilter?, emoji: EmojiFilter?, reaction: ReactionFilter?, count: Int, mask: [UInt8])?
     /// One person's messages closer together than this (seconds) are one run,
     /// which is what "more than 5 photos" counts across.
     private static let runGap = 5.0 * 60
-
-    /// Messages further apart than this (seconds) are not the same exchange.
-    private static let exchangeGap = 20.0 * 60
 
     private(set) var stats = LoadStats()
 
@@ -146,7 +193,6 @@ final class MessageStore: @unchecked Sendable {
     func loadNew(progress: ((Int) -> Void)? = nil) throws -> Int {
         let db = try open()
         let started = CFAbsoluteTimeGetCurrent()
-        let embedBefore = stats.embedSeconds
         let before = count
 
         // A cheap check first, so polling an idle database costs nothing.
@@ -201,7 +247,10 @@ final class MessageStore: @unchecked Sendable {
             // caption like "[2 photos]" or "[PDF: lease.pdf]" appended to the
             // text, so they show up in results and file names are searchable.
             var carried = [UInt8](repeating: 0, count: media.count)
-            if hasText, containsLink(from: bodyStart) { carried[MediaKind.link.rawValue] = 1 }
+            if hasText {
+                if containsLink(from: bodyStart) { carried[MediaKind.link.rawValue] = 1 }
+                indexEmoji(from: bodyStart, message: Int32(count))
+            }
             if let attached {
                 for file in attached { carried[file.kind.rawValue] &+= carried[file.kind.rawValue] < 255 ? 1 : 0 }
                 if hasText { text.append(0x0A) }
@@ -227,12 +276,13 @@ final class MessageStore: @unchecked Sendable {
 
             if count % 50_000 == 0 { progress?(count) }
         }
-        embedPending()
-
-        let total = CFAbsoluteTimeGetCurrent() - started
         if before == 0 {
-            stats.readSeconds = total - (stats.embedSeconds - embedBefore)
+            stats.readSeconds = CFAbsoluteTimeGetCurrent() - started
         }
+        loadReactions(db)
+        cachedMask = nil
+        // No incremental indexing: with anything new, embed everything again.
+        if count > before { embedAll() }
         stats.messages = count
         return count - before
     }
@@ -279,32 +329,103 @@ final class MessageStore: @unchecked Sendable {
     /// message ROWID -> its attachments, for messages not loaded yet. Empty if
     /// the database has no attachment tables.
     private func loadAttachments(_ db: OpaquePointer) -> [Int64: [Attachment]] {
-        let sql = """
-            SELECT j.message_id, IFNULL(a.mime_type, ''), IFNULL(a.uti, ''), IFNULL(a.transfer_name, ''), IFNULL(a.filename, '')
-            FROM message_attachment_join j JOIN attachment a ON a.ROWID = j.attachment_id
-            WHERE j.message_id > \(maxRowID)
-            ORDER BY j.message_id, a.ROWID
-            """
-        let rows = (try? query(db, sql) {
-            (sqlite3_column_int64($0, 0), Self.string($0, 1), Self.string($0, 2), Self.string($0, 3), Self.string($0, 4))
-        }) ?? []
+        // `is_sticker` is missing from older databases, so try with it first.
+        func rows(sticker: String) -> [(Int64, String, String, String, String, Bool)]? {
+            let sql = """
+                SELECT j.message_id, IFNULL(a.mime_type, ''), IFNULL(a.uti, ''), IFNULL(a.transfer_name, ''), IFNULL(a.filename, ''), \(sticker)
+                FROM message_attachment_join j JOIN attachment a ON a.ROWID = j.attachment_id
+                WHERE j.message_id > \(maxRowID)
+                ORDER BY j.message_id, a.ROWID
+                """
+            return try? query(db, sql) {
+                (sqlite3_column_int64($0, 0), Self.string($0, 1), Self.string($0, 2), Self.string($0, 3), Self.string($0, 4),
+                 sqlite3_column_int($0, 5) != 0)
+            }
+        }
+        let rows = rows(sticker: "IFNULL(a.is_sticker, 0)") ?? rows(sticker: "0") ?? []
         var result: [Int64: [Attachment]] = [:]
-        for (message, mime, uti, transferName, path) in rows {
+        for (message, mime, uti, transferName, path, isSticker) in rows {
             let name = ((transferName.isEmpty ? path : transferName) as NSString).lastPathComponent
             // Link previews store their thumbnails as attachments; those are not something a person sent.
             if name.hasSuffix(".pluginPayloadAttachment") { continue }
             result[message, default: []].append(Attachment(
-                kind: MediaKind.classify(mime: mime, uti: uti, name: name),
+                kind: isSticker ? .sticker : MediaKind.classify(mime: mime, uti: uti, name: name),
                 name: name, path: (path as NSString).expandingTildeInPath))
         }
         return result
+    }
+
+    /// Reads every tapback and sticker placed on a message. In chat.db a
+    /// reaction is itself a row in `message`: `associated_message_type` says
+    /// what it is (2000-2005 the classic six, 2006 an emoji, 2007 and 1000
+    /// stickers, 3000+ the removal of one) and `associated_message_guid`
+    /// points at the message it is on. Reloaded in full whenever anything is
+    /// new; does nothing if the database lacks these columns.
+    private func loadReactions(_ db: OpaquePointer) {
+        func rows(emoji: String) -> [(Int64, Int32, Bool, Int32, String)]? {
+            let sql = """
+                SELECT m.ROWID, r.associated_message_type, r.is_from_me, r.handle_id, \(emoji)
+                FROM message r JOIN message m ON m.guid = CASE
+                    WHEN r.associated_message_guid LIKE 'p:%' THEN substr(r.associated_message_guid, instr(r.associated_message_guid, '/') + 1)
+                    WHEN r.associated_message_guid LIKE 'bp:%' THEN substr(r.associated_message_guid, 4)
+                    ELSE r.associated_message_guid END
+                WHERE r.associated_message_type BETWEEN 1000 AND 3999
+                ORDER BY r.ROWID
+                """
+            return try? query(db, sql) {
+                (sqlite3_column_int64($0, 0), sqlite3_column_int($0, 1), sqlite3_column_int($0, 2) != 0,
+                 sqlite3_column_int($0, 3), Self.string($0, 4))
+            }
+        }
+        // The emoji column arrived with emoji tapbacks; older databases lack it.
+        guard let rows = rows(emoji: "IFNULL(r.associated_message_emoji, '')") ?? rows(emoji: "''") else { return }
+
+        reactions = [:]
+        for (rowID, type, isFromMe, handle, emoji) in rows {
+            guard let index = index(ofRowID: rowID) else { continue }
+            let removing = type >= 3000
+            let code = Int(type) - (removing ? 3000 : type >= 2000 ? 2000 : 1000)
+            guard let kind = type < 2000 ? ReactionKind.sticker : ReactionKind(rawValue: code) else { continue }
+            // One person has one tapback per message; a new one replaces it.
+            if kind != .sticker || removing {
+                reactions[index]?.removeAll {
+                    $0.isFromMe == isFromMe && $0.handle == handle && (removing ? $0.kind == kind : $0.kind != .sticker)
+                }
+            }
+            if !removing {
+                reactions[index, default: []].append(Reaction(kind: kind, emoji: emoji, isFromMe: isFromMe, handle: handle))
+            }
+        }
+        reactions = reactions.filter { !$0.value.isEmpty }
+    }
+
+    /// `rowIDs` is ascending, so a message's position is a binary search away.
+    private func index(ofRowID rowID: Int64) -> Int? {
+        var low = 0
+        var high = rowIDs.count - 1
+        while low <= high {
+            let mid = (low + high) / 2
+            if rowIDs[mid] == rowID { return mid }
+            if rowIDs[mid] < rowID { low = mid + 1 } else { high = mid - 1 }
+        }
+        return nil
+    }
+
+    /// "❤️", "👍 2": one entry per distinct reaction on a message.
+    private func reactionGlyphs(_ i: Int) -> [String] {
+        guard let all = reactions[i] else { return [] }
+        var counts: [(String, Int)] = []
+        for glyph in all.map(\.glyph) where !glyph.isEmpty {
+            if let at = counts.firstIndex(where: { $0.0 == glyph }) { counts[at].1 += 1 } else { counts.append((glyph, 1)) }
+        }
+        return counts.map { $0.1 > 1 ? "\($0.0) \($0.1)" : $0.0 }
     }
 
     /// "[2 photos] [PDF: lease.pdf]": what an attachment contributes to the
     /// embedded text. On screen the files themselves are shown instead.
     private static func caption(_ attached: [Attachment]) -> String {
         var parts: [String] = []
-        for (kind, noun) in [(MediaKind.image, "photo"), (.video, "video"), (.audio, "audio message")] {
+        for (kind, noun) in [(MediaKind.image, "photo"), (.video, "video"), (.audio, "audio message"), (.sticker, "sticker")] {
             let n = attached.filter { $0.kind == kind }.count
             if n > 0 { parts.append(n == 1 ? "[\(noun)]" : "[\(n) \(noun)s]") }
         }
@@ -312,6 +433,31 @@ final class MessageStore: @unchecked Sendable {
             parts.append("[\(file.kind == .pdf ? "PDF" : "file"): \(file.name)]")
         }
         return parts.joined(separator: " ")
+    }
+
+    /// Records which emoji appear in the text from `start` to the end of the
+    /// buffer. Only multi-byte UTF-8 is decoded, so plain text costs one
+    /// comparison per byte.
+    private func indexEmoji(from start: Int, message: Int32) {
+        var i = start
+        let end = text.count
+        while i < end {
+            let b = UInt32(text[i])
+            var value: UInt32 = 0
+            if b >= 0xF0, i + 3 < end {
+                value = (b & 0x07) << 18 | (UInt32(text[i + 1]) & 0x3F) << 12 | (UInt32(text[i + 2]) & 0x3F) << 6 | (UInt32(text[i + 3]) & 0x3F)
+                i += 4
+            } else if b >= 0xE2, b < 0xF0, i + 2 < end {
+                value = (b & 0x0F) << 12 | (UInt32(text[i + 1]) & 0x3F) << 6 | (UInt32(text[i + 2]) & 0x3F)
+                i += 3
+            } else {
+                i += 1
+                continue
+            }
+            if EmojiFilter.isEmoji(value), emojiMessages[value]?.last != message {
+                emojiMessages[value, default: []].append(message)
+            }
+        }
     }
 
     private func containsLink(from start: Int) -> Bool {
@@ -343,47 +489,78 @@ final class MessageStore: @unchecked Sendable {
         return true
     }
 
-    /// Embeds the exchange around every message not yet in the index. Runs
-    /// after a load so each message can see what came after it.
-    private func embedPending() {
-        guard count > embedded else { return }
+    /// Embeds every message at all three granularities, replacing whatever was
+    /// indexed before.
+    private func embedAll() {
         let started = CFAbsoluteTimeGetCurrent()
+        for layer in 0..<Int(MS_LAYERS) { ms_clear_layer(layer) }
+        guard count > 0 else { return }
+
+        // Layer 0, messages: the text buffer is already in the right shape.
+        text.withUnsafeBufferPointer { bytes in
+            offsets.withUnsafeBufferPointer { ms_add(0, bytes.baseAddress, $0.baseAddress, count) }
+        }
+
+        // Layer 1, exchanges. Each message is capped so a long one cannot
+        // drown out its neighbours.
+        func append(_ j: Int, to buffer: inout ContiguousArray<UInt8>) {
+            buffer.append(contentsOf: text[offsets[j]..<min(offsets[j + 1], offsets[j] + 400)])
+            buffer.append(0x0A)
+        }
+        embed(layer: 1, count: count) { i, buffer in
+            for j in exchange(around: i) { append(j, to: &buffer) }
+        }
+
+        // Layer 2, sittings: one vector shared by every message in the sitting.
+        var sittingOf = [UInt32](repeating: 0, count: count)
+        var sittings: [[Int32]] = []
+        for i in 0..<count {
+            let before = Int(previous[i])
+            if before >= 0, seconds(i) - seconds(before) <= settings.sittingGap,
+               sittings[Int(sittingOf[before])].count < settings.sittingLimit {
+                sittingOf[i] = sittingOf[before]
+                sittings[Int(sittingOf[i])].append(Int32(i))
+            } else {
+                sittingOf[i] = UInt32(sittings.count)
+                sittings.append([Int32(i)])
+            }
+        }
+        embed(layer: 2, count: sittings.count) { sitting, buffer in
+            for j in sittings[sitting] { append(Int(j), to: &buffer) }
+        }
+        ms_set_map(2, sittingOf, count)
+
+        stats.embedSeconds = CFAbsoluteTimeGetCurrent() - started
+    }
+
+    /// Builds `n` texts with `write` and embeds them into `layer`, in batches
+    /// so the scratch buffer stays small.
+    private func embed(layer: Int, count n: Int, _ write: (Int, inout ContiguousArray<UInt8>) -> Void) {
         var buffer = ContiguousArray<UInt8>()
         var ends = ContiguousArray<Int>([0])
         func flush() {
             buffer.withUnsafeBufferPointer { bytes in
-                ends.withUnsafeBufferPointer { ms_add(bytes.baseAddress, $0.baseAddress, $0.count - 1) }
+                ends.withUnsafeBufferPointer { ms_add(layer, bytes.baseAddress, $0.baseAddress, $0.count - 1) }
             }
             buffer.removeAll(keepingCapacity: true)
             ends.removeAll(keepingCapacity: true)
             ends.append(0)
         }
-        for i in embedded..<count {
-            for j in exchange(around: i) {
-                // The message itself counts twice; neighbours are capped so a
-                // long one cannot drown it out.
-                let limit = j == i ? 1200 : 400
-                let piece = text[offsets[j]..<min(offsets[j + 1], offsets[j] + limit)]
-                for _ in 0..<(j == i ? 2 : 1) {
-                    buffer.append(contentsOf: piece)
-                    buffer.append(0x0A)
-                }
-            }
+        for i in 0..<n {
+            write(i, &buffer)
             ends.append(buffer.count)
             if ends.count > 50_000 { flush() }
         }
         flush()
-        embedded = count
-        stats.embedSeconds += CFAbsoluteTimeGetCurrent() - started
     }
 
-    /// Message `i` with up to two neighbours either side from the same chat
-    /// and the same sitting, oldest first.
+    /// Message `i` with its neighbours either side from the same chat, oldest
+    /// first: what is embedded as its exchange and shown as its result.
     private func exchange(around i: Int) -> [Int] {
         let time = seconds(i)
         var result: [Int] = []
         var j = Int(previous[i])
-        while j >= 0, result.count < 2, abs(time - seconds(j)) <= Self.exchangeGap {
+        while j >= 0, result.count < settings.exchangeReach, abs(time - seconds(j)) <= settings.exchangeGap {
             result.append(j)
             j = Int(previous[j])
         }
@@ -391,7 +568,7 @@ final class MessageStore: @unchecked Sendable {
         result.append(i)
         let before = result.count
         j = Int(next[i])
-        while j >= 0, result.count - before < 2, abs(seconds(j) - time) <= Self.exchangeGap {
+        while j >= 0, result.count - before < settings.exchangeReach, abs(seconds(j) - time) <= settings.exchangeGap {
             result.append(j)
             j = Int(next[j])
         }
@@ -415,15 +592,22 @@ final class MessageStore: @unchecked Sendable {
         }
         var mask: [UInt8]?
         if parsed.isStructured {
-            mask = self.mask(handles: parsed.handles, sender: parsed.sender, media: parsed.media)
+            mask = self.mask(handles: parsed.handles, sender: parsed.sender, media: parsed.media, emoji: parsed.emoji, reaction: parsed.reaction)
             let names = Set(parsed.handles.map(name(forHandle:))).sorted()
             let from = !names.isEmpty ? "from " + names.formatted(.list(type: .or))
                 : parsed.sender == .others ? "from other people" : parsed.sender == .me ? "from you" : ""
             results.filter = (["Only messages"]
                 + (from.isEmpty ? [] : [from])
-                + (parsed.media.map { [$0.description] } ?? [])).joined(separator: " ")
+                + (parsed.media.map { [$0.description] } ?? [])
+                + (parsed.emoji.map { [$0.description] } ?? [])
+                + (parsed.reaction.map { reaction in
+                    let reactors = Set(reaction.byHandles.map(name(forHandle:))).sorted()
+                    let by = !reactors.isEmpty ? " from " + reactors.formatted(.list(type: .or))
+                        : reaction.by == .me ? " from you" : reaction.by == .others ? " from someone else" : ""
+                    return [reaction.description + by]
+                } ?? [])).joined(separator: " ")
         }
-        paging = Paging(token: token, count: count, query: Array(parsed.remainder.utf8), mask: mask, nextRecent: count - 1)
+        paging = Paging(token: token, count: count, query: Array(parsed.remainder.utf8), weights: settings.weights, brevity: settings.brevity, mask: mask, nextRecent: count - 1)
         if let page = nextPage(token: token) {
             results.hits = page.hits
             results.exhausted = page.exhausted
@@ -472,10 +656,10 @@ final class MessageStore: @unchecked Sendable {
             let found = state.query.withUnsafeBufferPointer { q in
                 if let mask = state.mask {
                     return mask.withUnsafeBufferPointer {
-                        ms_search(q.baseAddress, q.count, batch, $0.baseAddress, state.afterScore, state.afterIndex, &indices, &scores)
+                        ms_search(q.baseAddress, q.count, state.weights, state.brevity, batch, $0.baseAddress, state.afterScore, state.afterIndex, &indices, &scores)
                     }
                 }
-                return ms_search(q.baseAddress, q.count, batch, nil, state.afterScore, state.afterIndex, &indices, &scores)
+                return ms_search(q.baseAddress, q.count, state.weights, state.brevity, batch, nil, state.afterScore, state.afterIndex, &indices, &scores)
             }
             for n in 0..<found {
                 state.afterScore = scores[n]
@@ -517,7 +701,7 @@ final class MessageStore: @unchecked Sendable {
         }
 
         let lines = exchange.map { j in
-            Hit.Line(id: j, sender: fromMe[j] ? "You" : firstName(name(forHandle: handleIDs[j])), text: body(j), isMatch: j == i, attachments: attachments[j] ?? [])
+            Hit.Line(id: j, sender: fromMe[j] ? "You" : firstName(name(forHandle: handleIDs[j])), text: body(j), isMatch: j == i, attachments: attachments[j] ?? [], reactions: reactionGlyphs(j))
         }
         return Hit(
             id: i, rowID: rowIDs[i], text: body(i),
@@ -557,8 +741,9 @@ final class MessageStore: @unchecked Sendable {
     /// One byte per message: 1 where it passes the filter. With a minimum
     /// above one, attachments are counted across the sender's run of messages
     /// and only the run's first carrying message is marked.
-    private func mask(handles: Set<Int32>, sender: QueryParser.Sender, media filter: MediaFilter?) -> [UInt8] {
-        if let cached = cachedMask, cached.handles == handles, cached.sender == sender, cached.media == filter, cached.count == count {
+    private func mask(handles: Set<Int32>, sender: QueryParser.Sender, media filter: MediaFilter?, emoji: EmojiFilter?, reaction: ReactionFilter?) -> [UInt8] {
+        if let cached = cachedMask, cached.handles == handles, cached.sender == sender, cached.media == filter,
+           cached.emoji == emoji, cached.reaction == reaction, cached.count == count {
             return cached.mask
         }
         var mask = [UInt8](repeating: 0, count: count)
@@ -600,7 +785,24 @@ final class MessageStore: @unchecked Sendable {
             }
             if total >= filter.minimum, first >= 0 { mask[first] = 1 }
         }
-        cachedMask = (handles, sender, filter, count, mask)
+        if let emoji {
+            // Keep only messages containing a matching emoji.
+            var carries = [Bool](repeating: false, count: count)
+            for (value, messages) in emojiMessages {
+                let name = Unicode.Scalar(value)?.properties.name ?? ""
+                if emoji.matches(value: value, name: name) {
+                    for message in messages { carries[Int(message)] = true }
+                }
+            }
+            for i in 0..<count where !carries[i] { mask[i] = 0 }
+        }
+        if let reaction {
+            // Keep only messages that received a matching reaction.
+            for i in 0..<count where mask[i] != 0 {
+                if !(reactions[i]?.contains(where: reaction.matches) ?? false) { mask[i] = 0 }
+            }
+        }
+        cachedMask = (handles, sender, filter, emoji, reaction, count, mask)
         return mask
     }
 

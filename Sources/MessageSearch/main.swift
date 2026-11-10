@@ -32,7 +32,7 @@ struct MessageSearchApp: App {
                 .onAppear { model.start() }
         }
         .defaultSize(width: 720, height: 600)
-        .windowStyle(.hiddenTitleBar)
+        .windowToolbarStyle(.unified(showsTitle: false))
     }
 }
 
@@ -40,6 +40,15 @@ MessageSearchApp.main()
 
 func runBenchmark(path: String, queries: [String]) {
     let store = MessageStore(path: path)
+    // MS_BLEND="message,exchange,sitting weights, then the three brevity values"
+    if let blend = ProcessInfo.processInfo.environment["MS_BLEND"]?.split(separator: ",").compactMap({ Float($0) }), blend.count == 6 {
+        store.settings.messageWeight = blend[0]
+        store.settings.exchangeWeight = blend[1]
+        store.settings.sittingWeight = blend[2]
+        store.settings.messageBrevity = blend[3]
+        store.settings.exchangeBrevity = blend[4]
+        store.settings.sittingBrevity = blend[5]
+    }
     do {
         try store.loadNew()
     } catch {
@@ -53,13 +62,17 @@ func runBenchmark(path: String, queries: [String]) {
     for query in queries {
         var times: [Double] = []
         var hits: [Hit] = []
+        var filter = ""
         for _ in 0..<200 {
             let started = CFAbsoluteTimeGetCurrent()
-            hits = store.search(query, token: 1).hits
+            let results = store.search(query, token: 1)
+            hits = results.hits
+            filter = results.filter
             times.append(CFAbsoluteTimeGetCurrent() - started)
         }
         times.sort()
         print(String(format: "\n\"%@\": median %.2f ms, p95 %.2f ms", query, times[100] * 1000, times[190] * 1000))
+        if !filter.isEmpty { print("  filter: \(filter)") }
         // Page on from the first page, as scrolling would.
         var seen = Set(hits.map(\.id))
         var total = hits.count

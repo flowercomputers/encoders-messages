@@ -3,44 +3,66 @@ import SwiftUI
 struct ContentView: View {
     @ObservedObject var model: AppModel
     @FocusState private var searchFocused: Bool
+    @State private var keyboard = KeyboardRouter()
 
     var body: some View {
-        VStack(spacing: 0) {
-            searchField
-            if !model.filter.isEmpty {
-                Label(model.filter, systemImage: "line.3.horizontal.decrease.circle")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 18)
-                    .padding(.bottom, 8)
-            }
-            Divider()
-            content.frame(maxWidth: .infinity, maxHeight: .infinity)
-            Divider()
-            footer
+        // Results fill the window. The search field lives in the window's
+        // toolbar, which gives it the system's Liquid Glass and lines it up
+        // with the close / minimise / zoom buttons; the filter chip and status
+        // bar are glass controls floating over the results.
+        GeometryReader { window in
+            // The ZStack matters: `content` swaps between different views (the
+            // hint, then the results). Hanging the toolbar straight off a view
+            // that gets swapped makes the search field lose keyboard focus
+            // after the first character typed.
+            ZStack { content }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .floatingBar(edge: .top) { filterChip }
+                .floatingBar(edge: .bottom) { footer }
+                .toolbar {
+                    ToolbarItem(placement: .principal) {
+                        // Toolbar items take their ideal width, so size the
+                        // field to the window, leaving room for the buttons.
+                        searchField.frame(width: max(240, window.size.width - 120))
+                    }
+                }
         }
         .frame(minWidth: 520, minHeight: 360)
-        .background(.background)
-        .onAppear { searchFocused = true }
+        .onAppear {
+            searchFocused = true
+            keyboard.install(model: model)
+        }
     }
 
     private var searchField: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 8) {
             Image(systemName: "magnifyingglass")
-                .font(.system(size: 18, weight: .medium))
+                .font(.system(size: 14, weight: .medium))
                 .foregroundStyle(.secondary)
             TextField("Search your messages by meaning", text: $model.query)
                 .textFieldStyle(.plain)
-                .font(.system(size: 22))
+                .font(.system(size: 16))
                 .focused($searchFocused)
                 .onSubmit { model.openSelection() }
                 .onKeyPress(.downArrow) { model.moveSelection(1); return .handled }
                 .onKeyPress(.upArrow) { model.moveSelection(-1); return .handled }
                 .onKeyPress(.escape) { model.query = ""; return .handled }
         }
-        .padding(.horizontal, 18)
-        .padding(.vertical, 14)
+        .padding(.horizontal, 10)
+    }
+
+    @ViewBuilder
+    private var filterChip: some View {
+        if !model.filter.isEmpty {
+            Label(model.filter, systemImage: "line.3.horizontal.decrease.circle")
+                .font(.caption)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .glassCapsule()
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+        }
     }
 
     @ViewBuilder
@@ -94,17 +116,23 @@ struct ContentView: View {
         HStack {
             if model.phase == .ready {
                 Text("\(model.indexed.formatted()) messages · read in \(seconds(model.stats.readSeconds)) · embedded in \(seconds(model.stats.embedSeconds))")
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .glassCapsule()
             }
             Spacer()
             if !model.hits.isEmpty {
                 Text("\(model.hits.count.formatted())\(model.canLoadMore ? "+" : "") results · searched in \(seconds(model.searchSeconds)) · ↩ opens in Messages")
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .glassCapsule()
             }
         }
         .font(.caption)
         .monospacedDigit()
         .foregroundStyle(.secondary)
-        .padding(.horizontal, 14)
-        .padding(.vertical, 7)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
     }
 
     private func seconds(_ s: Double) -> String {
@@ -138,6 +166,18 @@ private struct HitRow: View {
                         if !line.attachments.isEmpty {
                             AttachmentStrip(attachments: line.attachments, dimmed: !line.isMatch, onAccent: selected)
                         }
+                        if !line.reactions.isEmpty {
+                            // Tapbacks and stickers this message received.
+                            HStack(spacing: 4) {
+                                ForEach(line.reactions, id: \.self) { reaction in
+                                    Text(reaction)
+                                        .font(.caption)
+                                        .padding(.horizontal, 6)
+                                        .padding(.vertical, 2)
+                                        .background(selected ? Color.white.opacity(0.2) : Color.primary.opacity(0.07), in: Capsule())
+                                }
+                            }
+                        }
                     }
                     Spacer(minLength: 0)
                 }
@@ -145,7 +185,7 @@ private struct HitRow: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
-        .background(selected ? Color.accentColor : .clear, in: RoundedRectangle(cornerRadius: 8))
+        .background(selected ? Color.accentColor : .clear, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         .padding(.horizontal, 6)
     }
 
@@ -184,6 +224,7 @@ private struct AccessView: View {
                 .frame(maxWidth: 400)
             Button("Open Full Disk Access Settings", action: openSettings)
                 .controlSize(.large)
+                .prominentGlassButton()
                 .keyboardShortcut(.defaultAction)
             Text("If nothing changes after you turn it on, quit and reopen the app.")
                 .font(.caption)

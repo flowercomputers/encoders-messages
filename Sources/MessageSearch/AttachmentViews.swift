@@ -11,8 +11,8 @@ struct AttachmentStrip: View {
     private static let limit = 8
 
     var body: some View {
-        let visual = attachments.filter { $0.kind == .image || $0.kind == .video }
-        let other = attachments.filter { $0.kind != .image && $0.kind != .video }
+        let visual = attachments.filter { $0.kind == .image || $0.kind == .video || $0.kind == .sticker }
+        let other = attachments.filter { $0.kind != .image && $0.kind != .video && $0.kind != .sticker }
         VStack(alignment: .leading, spacing: 4) {
             if !visual.isEmpty {
                 HStack(spacing: 4) {
@@ -100,6 +100,7 @@ extension MediaKind {
         case .pdf: "doc.richtext"
         case .file: "doc"
         case .link: "link"
+        case .sticker: "face.smiling"
         }
     }
 }

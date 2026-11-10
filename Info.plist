@@ -6,6 +6,10 @@
 	<string>Message Search</string>
 	<key>CFBundleExecutable</key>
 	<string>MessageSearch</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundleIconName</key>
+	<string>AppIcon</string>
 	<key>CFBundleIdentifier</key>
 	<string>com.flowercomputer.MessageSearch</string>
 	<key>CFBundleName</key>
