@@ -105,10 +105,17 @@ pub unsafe extern "C" fn ms_add(bytes: *const u8, offsets: *const usize, n: usiz
     index.inv_norms.extend_from_slice(&inv_norms);
 }
 
-/// Keep the best `k` of `hits`, best first.
+/// The ranking: higher score first, ties broken by lower index. It is a total
+/// order, which is what lets a (score, index) pair act as a paging cursor.
+#[inline]
+fn rank(a: &(f32, u32), b: &(f32, u32)) -> std::cmp::Ordering {
+    b.0.total_cmp(&a.0).then(a.1.cmp(&b.1))
+}
+
+/// Keep the best `k` of `hits`.
 fn keep_top(hits: &mut Vec<(f32, u32)>, k: usize) {
     if hits.len() > k {
-        hits.select_nth_unstable_by(k - 1, |a, b| b.0.total_cmp(&a.0));
+        hits.select_nth_unstable_by(k - 1, rank);
         hits.truncate(k);
     }
 }
@@ -120,6 +127,12 @@ fn keep_top(hits: &mut Vec<(f32, u32)>, k: usize) {
 /// `filter` is either null or one byte per entry; entries whose byte is 0 are
 /// skipped.
 ///
+/// `after_score` and `after_index` page through the ranking: only entries
+/// ranked strictly after that (score, index) pair are returned. Pass the last
+/// result of the previous page, or `f32::INFINITY` for the first page. Every
+/// page is one scan, so reaching result 10,000 costs no more memory than
+/// reaching result 10.
+///
 /// # Safety
 /// `query` must be valid for `query_len` bytes; `filter`, if not null, for
 /// `ms_count()` bytes; `out_indices` and `out_scores` must each have room for
@@ -130,6 +143,8 @@ pub unsafe extern "C" fn ms_search(
     query_len: usize,
     k: usize,
     filter: *const u8,
+    after_score: f32,
+    after_index: u32,
     out_indices: *mut u32,
     out_scores: *mut f32,
 ) -> usize {
@@ -160,9 +175,13 @@ pub unsafe extern "C" fn ms_search(
                 if allowed.is_some_and(|f| f[i] == 0) {
                     continue;
                 }
-                let score = dot(&q, v) as f32 * inv;
+                let score = dot(&q, v) as f32 * inv * q_inv;
+                let index = base + i as u32;
+                if score > after_score || (score == after_score && index <= after_index) {
+                    continue;
+                }
                 if score > floor {
-                    local.push((score, base + i as u32));
+                    local.push((score, index));
                     if local.len() == 2 * k {
                         keep_top(&mut local, k);
                         floor = local.iter().fold(f32::INFINITY, |m, h| m.min(h.0));
@@ -179,12 +198,12 @@ pub unsafe extern "C" fn ms_search(
         });
     drop(index);
 
-    hits.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+    hits.sort_unstable_by(rank);
     let out_indices = unsafe { std::slice::from_raw_parts_mut(out_indices, k) };
     let out_scores = unsafe { std::slice::from_raw_parts_mut(out_scores, k) };
     for (i, (score, idx)) in hits.iter().enumerate() {
         out_indices[i] = *idx;
-        out_scores[i] = score * q_inv;
+        out_scores[i] = *score;
     }
     hits.len()
 }

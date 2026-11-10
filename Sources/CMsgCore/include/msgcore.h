@@ -16,8 +16,11 @@ void ms_clear(void);
 void ms_add(const uint8_t *bytes, const size_t *offsets, size_t n);
 /// Top-k search. Writes up to `k` indices (insertion order) and scores, best
 /// first; returns how many were written. `filter` is NULL or one byte per
-/// entry, where 0 means "skip this entry".
+/// entry, where 0 means "skip this entry". Only entries ranked strictly after
+/// (after_score, after_index) are returned: pass the previous page's last
+/// result to get the next page, or INFINITY for the first.
 size_t ms_search(const uint8_t *query, size_t query_len, size_t k,
-                 const uint8_t *filter, uint32_t *out_indices, float *out_scores);
+                 const uint8_t *filter, float after_score, uint32_t after_index,
+                 uint32_t *out_indices, float *out_scores);
 
 #endif

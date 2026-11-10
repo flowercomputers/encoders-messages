@@ -72,6 +72,7 @@ struct ContentView: View {
                     ForEach(Array(model.hits.enumerated()), id: \.element.id) { index, hit in
                         HitRow(hit: hit, selected: index == model.selection)
                             .id(hit.id)
+                            .onAppear { model.loadMoreIfNeeded(near: index) }
                             .contentShape(Rectangle())
                             .onTapGesture {
                                 model.selection = index
@@ -96,7 +97,7 @@ struct ContentView: View {
             }
             Spacer()
             if !model.hits.isEmpty {
-                Text("searched in \(seconds(model.searchSeconds)) · ↩ opens in Messages")
+                Text("\(model.hits.count.formatted())\(model.canLoadMore ? "+" : "") results · searched in \(seconds(model.searchSeconds)) · ↩ opens in Messages")
             }
         }
         .font(.caption)

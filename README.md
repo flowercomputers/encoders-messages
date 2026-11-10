@@ -69,6 +69,10 @@ Spotlight uses for Messages results. It is undocumented, so Apple could change i
   thumbnails for photos and videos (`AttachmentViews.swift`), a named chip for
   other files, and an icon when the file is not on this Mac. The parser is `Sources/MessageSearch/QueryFilter.swift`.
 - Overlapping results from one exchange are collapsed to the best one.
+- **Results are unbounded.** The list loads 60 at a time as you scroll. The
+  core takes a (score, index) cursor and returns the next best matches after
+  it, so each page is one more scan (~1 ms) and nothing is computed or kept for
+  results you never scroll to.
 
 The model is a static embedding: it matches on what an exchange is *about*, not
 on what is *happening* in it. "funny" finds "LOL"; "news about something" finds

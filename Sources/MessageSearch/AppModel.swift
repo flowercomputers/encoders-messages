@@ -17,6 +17,9 @@ final class AppModel: ObservableObject {
     @Published private(set) var hits: [Hit] = []
     /// The people / attachment filter found in the query, or "".
     @Published private(set) var filter = ""
+    /// False once every result has been loaded.
+    @Published private(set) var canLoadMore = false
+    private var loadingMore = false
     @Published var selection = 0
     @Published private(set) var phase = Phase.loading
     @Published private(set) var indexed = 0
@@ -90,6 +93,7 @@ final class AppModel: ObservableObject {
         let query = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty else {
             hits = []
+            canLoadMore = false
             filter = ""
             selection = 0
             return
@@ -97,11 +101,13 @@ final class AppModel: ObservableObject {
         let store = store
         engine.async {
             let started = CFAbsoluteTimeGetCurrent()
-            let results = store.search(query)
+            let results = store.search(query, token: generation)
             let elapsed = CFAbsoluteTimeGetCurrent() - started
             DispatchQueue.main.async {
                 guard generation == self.generation else { return }  // a newer keystroke won
                 self.hits = results.hits
+                self.canLoadMore = !results.exhausted
+                self.loadingMore = false
                 self.filter = results.filter
                 self.selection = 0
                 self.searchSeconds = elapsed
@@ -112,6 +118,26 @@ final class AppModel: ObservableObject {
     func moveSelection(_ delta: Int) {
         guard !hits.isEmpty else { return }
         selection = min(max(selection + delta, 0), hits.count - 1)
+        loadMoreIfNeeded(near: selection)
+    }
+
+    /// Results are unbounded. Called as rows come on screen: when the user is
+    /// within a screenful of the end, fetch the next page.
+    func loadMoreIfNeeded(near index: Int) {
+        guard canLoadMore, !loadingMore, index >= hits.count - 20 else { return }
+        loadingMore = true
+        let generation = generation
+        let store = store
+        engine.async {
+            let page = store.nextPage(token: generation)
+            DispatchQueue.main.async {
+                guard generation == self.generation else { return }
+                self.loadingMore = false
+                guard let page else { return }
+                self.hits.append(contentsOf: page.hits)
+                self.canLoadMore = !page.exhausted
+            }
+        }
     }
 
     func openSelection() {

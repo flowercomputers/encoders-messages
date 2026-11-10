@@ -37,6 +37,8 @@ struct SearchResults {
     var hits: [Hit] = []
     /// Describes the people / attachment filter found in the query, or "".
     var filter = ""
+    /// True once there is nothing further to page in.
+    var exhausted = true
 }
 
 struct LoadStats {
@@ -99,6 +101,23 @@ final class MessageStore: @unchecked Sendable {
     }
     /// Lowercased name word -> handles of people with that name. Built lazily.
     private var peopleByName: [String: Set<Int32>]?
+    /// Where the current search has got to; see `nextPage`.
+    private struct Paging {
+        var token: Int
+        var count: Int
+        var query: [UInt8]
+        var mask: [UInt8]?
+        /// Messages already shown as part of some result's exchange.
+        var shown = Set<Int>()
+        /// Semantic search: the last candidate consumed, as a ranking cursor.
+        var afterScore = Float.infinity
+        var afterIndex: UInt32 = 0
+        /// Filter-only search: the next message to look at, walking backwards.
+        var nextRecent: Int
+        var exhausted = false
+    }
+    private var paging: Paging?
+
     private var cachedMask: (handles: Set<Int32>, sender: QueryParser.Sender, media: MediaFilter?, count: Int, mask: [UInt8])?
     /// One person's messages closer together than this (seconds) are one run,
     /// which is what "more than 5 photos" counts across.
@@ -387,7 +406,9 @@ final class MessageStore: @unchecked Sendable {
 
     // MARK: Searching
 
-    func search(_ query: String, limit: Int = 60) -> SearchResults {
+    /// Starts a search and returns its first page. `token` identifies the
+    /// search to `nextPage`, so a page requested for an older query is ignored.
+    func search(_ query: String, token: Int = 0) -> SearchResults {
         var results = SearchResults()
         let parsed = QueryParser.parse(query) { word in
             Self.ambiguousNames.contains(word) ? nil : self.people(named: word)
@@ -402,42 +423,69 @@ final class MessageStore: @unchecked Sendable {
                 + (from.isEmpty ? [] : [from])
                 + (parsed.media.map { [$0.description] } ?? [])).joined(separator: " ")
         }
+        paging = Paging(token: token, count: count, query: Array(parsed.remainder.utf8), mask: mask, nextRecent: count - 1)
+        if let page = nextPage(token: token) {
+            results.hits = page.hits
+            results.exhausted = page.exhausted
+        }
+        return results
+    }
 
-        var shown = Set<Int>()
+    /// The next `limit` results of the search started with `token`, or nil if
+    /// that search has been replaced. Results are unbounded: every page is one
+    /// more scan that resumes from a cursor, so nothing is computed or kept for
+    /// results nobody scrolls to.
+    func nextPage(token: Int, limit: Int = 60) -> (hits: [Hit], exhausted: Bool)? {
+        guard var state = paging, state.token == token else { return nil }
+        defer { paging = state }
+        // New messages arrived since this search began; a fresh search follows.
+        guard state.count == count, !state.exhausted else { return ([], true) }
+
+        var hits: [Hit] = []
         func add(_ i: Int, score: Float) {
-            if shown.contains(i) { return }
+            if state.shown.contains(i) { return }
             let exchange = exchange(around: i)
-            shown.formUnion(exchange)
-            results.hits.append(hit(i, exchange: exchange, score: score))
+            state.shown.formUnion(exchange)
+            hits.append(hit(i, exchange: exchange, score: score))
         }
 
         // Nothing left to match by meaning ("maya sends >5 images"): list
         // what passes the filter, newest first.
-        if let mask, parsed.remainder.isEmpty {
-            var i = count - 1
-            while i >= 0, results.hits.count < limit {
-                if mask[i] != 0 { add(i, score: 0) }
-                i -= 1
+        if let mask = state.mask, state.query.isEmpty {
+            while state.nextRecent >= 0, hits.count < limit {
+                if mask[state.nextRecent] != 0 { add(state.nextRecent, score: 0) }
+                state.nextRecent -= 1
             }
-            return results
+            state.exhausted = state.nextRecent < 0
+            return (hits, state.exhausted)
         }
 
-        // Neighbouring messages share most of their exchange, so they arrive in
-        // clumps; fetch extra and keep the best one per exchange.
-        let wanted = limit * 5
-        var indices = [UInt32](repeating: 0, count: wanted)
-        var scores = [Float](repeating: 0, count: wanted)
-        var utf8 = Array(parsed.remainder.utf8)
-        let found = utf8.withUnsafeMutableBufferPointer { q in
-            if let mask {
-                return mask.withUnsafeBufferPointer { ms_search(q.baseAddress, q.count, wanted, $0.baseAddress, &indices, &scores) }
+        // Neighbouring messages share most of their exchange, so candidates
+        // arrive in clumps and most are folded into a result already shown.
+        // Keep pulling batches until the page is full.
+        let batch = 256
+        var indices = [UInt32](repeating: 0, count: batch)
+        var scores = [Float](repeating: 0, count: batch)
+        var scans = 0
+        while hits.count < limit, !state.exhausted, scans < 24 {
+            scans += 1
+            let found = state.query.withUnsafeBufferPointer { q in
+                if let mask = state.mask {
+                    return mask.withUnsafeBufferPointer {
+                        ms_search(q.baseAddress, q.count, batch, $0.baseAddress, state.afterScore, state.afterIndex, &indices, &scores)
+                    }
+                }
+                return ms_search(q.baseAddress, q.count, batch, nil, state.afterScore, state.afterIndex, &indices, &scores)
             }
-            return ms_search(q.baseAddress, q.count, wanted, nil, &indices, &scores)
+            for n in 0..<found {
+                state.afterScore = scores[n]
+                state.afterIndex = indices[n]
+                add(Int(indices[n]), score: scores[n])
+                if hits.count == limit { break }
+            }
+            if found < batch { state.exhausted = hits.count < limit || found == 0 }
         }
-        for n in 0..<found where results.hits.count < limit {
-            add(Int(indices[n]), score: scores[n])
-        }
-        return results
+        return (hits, state.exhausted)
     }
 
     /// The message's words, without attachment placeholders or caption.
